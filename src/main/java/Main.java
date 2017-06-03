@@ -19,10 +19,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.zip.Adler32;
 import java.util.zip.CheckedOutputStream;
 import java.util.zip.ZipEntry;
@@ -32,8 +32,9 @@ import java.util.zip.ZipOutputStream;
  * Created by ssr on 02.06.17.
  */
 public class Main {
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd-MM-yyyy--HH-mm");
 
-    public static void main(String[] args) throws IOException, ServerException {
+    public static void main(String[] args) throws IOException, ServerException, InterruptedException {
         Properties properties = readProperties(args);
 
         Credentials credentials = new Credentials(properties.getProperty("user"), properties.getProperty("otoken"));
@@ -44,14 +45,56 @@ public class Main {
         String backupFolderPath = properties.getProperty("yadisk.backup.folder");
         try {
             Resource bacupFolder = client.getResources(new ResourcesArgs.Builder().setPath(backupFolderPath).build());
+            //TODO: продумать механизм удаления старых бэкапов
         } catch (HttpCodeException e) {
             if (e.getCode() == HttpURLConnection.HTTP_NOT_FOUND) {
                 //creating folder
-                Link link = client.makeFolder(backupFolderPath);
-
+                client.makeFolder(backupFolderPath);
             }
         }
 
+
+        final boolean removeAfterBackup = BooleanUtils.toBoolean(properties.getProperty("remove.after.backup", "false"));
+
+        Map<String, String> propToFolderName = propertieToName(properties);
+
+        int processors = Runtime.getRuntime().availableProcessors();
+        int threadPoolSize = processors;
+        if (propToFolderName.size() < processors) {
+            threadPoolSize = propToFolderName.size();
+        }
+
+        ExecutorService executorService = Executors.newFixedThreadPool(threadPoolSize);
+
+        List<Callable<Void>> toExecute = new ArrayList<>();
+
+        for (String propName : propToFolderName.keySet()) {
+            toExecute.add(() -> {
+                String path = properties.getProperty(propName);
+                Path toArchive = Paths.get(path);
+                Path archivePath;
+                String zipName = propToFolderName.get(propName) + "-" + DATE_TIME_FORMATTER.format(LocalDateTime.now()) + ".zip";
+                if (Files.isDirectory(toArchive)) {
+                    archivePath = Paths.get(toArchive.toString(), zipName);
+                } else {
+                    Path parent = toArchive.getParent();
+                    archivePath = Paths.get(parent.toString(), zipName);
+                }
+                archive(toArchive, archivePath);
+                Link uploadLink = client.getUploadLink(backupFolderPath + "/" + zipName, false);
+                client.uploadFile(uploadLink, false, archivePath.toFile(), null);
+                if (removeAfterBackup) {
+                    Files.delete(archivePath);
+                }
+                return null;
+            });
+        }
+        executorService.invokeAll(toExecute);
+        // TODO: 04.06.17 проверка на то что все прошло хорошо, если нет, расказать об этом
+        executorService.shutdown();
+    }
+
+    private static Map<String, String> propertieToName(Properties properties) {
         Map<String, String> propToFolderName = new HashMap<>();
 
         Enumeration<String> enumeration = (Enumeration<String>) properties.propertyNames();
@@ -64,37 +107,14 @@ public class Main {
             if (StringUtils.isBlank(folderName) || StringUtils.contains(folderName, ".")) {
                 throw new IllegalArgumentException("Property name " + propertyName + " not valid.");
             }
+            String propValue = properties.getProperty(propertyName);
+            if (StringUtils.isBlank(propValue) || Files.notExists(Paths.get(propValue))) {
+                throw new IllegalArgumentException("Not valid value of propertie: " + propertyName + "  - " + propValue + ". Value empty or path not exist");
+            }
+
             propToFolderName.put(propertyName, folderName);
         }
-
-        Map<Path, String> achived = new HashMap<>();
-
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy--HH-mm");
-
-        for (String propName : propToFolderName.keySet()) {
-            String path = properties.getProperty(propName);
-            Path toArchive = Paths.get(path);
-            Path archivePath;
-            String zipName = propToFolderName.get(propName) + "-" + formatter.format(LocalDateTime.now()) + ".zip";
-            if (Files.isDirectory(toArchive)) {
-                archivePath = Paths.get(toArchive.toString(), zipName);
-            } else {
-                Path parent = toArchive.getParent();
-                archivePath = Paths.get(parent.toString(), zipName);
-            }
-            archive(toArchive, archivePath);
-            achived.put(archivePath, zipName);
-        }
-
-        boolean removeAfterBackup = BooleanUtils.toBoolean(properties.getProperty("remove.after.backup", "false"));
-
-        for (Path archive : achived.keySet()) {
-            Link uploadLink = client.getUploadLink(backupFolderPath + "/" + achived.get(archive), false);
-            client.uploadFile(uploadLink, false, archive.toFile(), null);
-            if (removeAfterBackup) {
-                Files.delete(archive);
-            }
-        }
+        return propToFolderName;
     }
 
     public static void archive(Path folderToArchive, Path outputPath) {
