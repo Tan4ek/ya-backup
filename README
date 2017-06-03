@@ -1,0 +1,4 @@
+Создаем рядом с .jar файл properties
+
+Зайти на https://oauth.yandex.ru/authorize?response_type=token&client_id=02ab0e23d984472a92b5d4cd176a4bf0
+Скопировать полейченное значение в папку property
