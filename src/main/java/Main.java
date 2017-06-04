@@ -35,14 +35,19 @@ public class Main {
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd-MM-yyyy--HH-mm");
 
     public static void main(String[] args) throws IOException, ServerException, InterruptedException {
-        Properties properties = readProperties(args);
+        String pathToProperties = "properties";
+        if (args != null && args.length > 0 && args[0] != null) {
+            pathToProperties = args[0];
+        }
 
-        Credentials credentials = new Credentials(properties.getProperty("user"), properties.getProperty("otoken"));
+        Configuration configuration = readConfiguration(pathToProperties);
+
+        Credentials credentials = new Credentials(configuration.getUser(), configuration.getToken());
 
         RestClient client = new RestClient(credentials);
 
 
-        String backupFolderPath = properties.getProperty("yadisk.backup.folder");
+        String backupFolderPath = configuration.getYandexDiskFolder();
         try {
             Resource bacupFolder = client.getResources(new ResourcesArgs.Builder().setPath(backupFolderPath).build());
             //TODO: продумать механизм удаления старых бэкапов
@@ -53,33 +58,24 @@ public class Main {
             }
         }
 
+        final boolean removeAfterBackup = configuration.isRemoveArchiveAfterBackup();
 
-        final boolean removeAfterBackup = BooleanUtils.toBoolean(properties.getProperty("remove.after.backup", "false"));
+        List<Callable<Void>> toExecute = new ArrayList<>();
 
-        Map<String, String> propToFolderName = propertieToName(properties);
+        Map<Path, String> backupFolders = configuration.getBackupFolders();
 
         int processors = Runtime.getRuntime().availableProcessors();
         int threadPoolSize = processors;
-        if (propToFolderName.size() < processors) {
-            threadPoolSize = propToFolderName.size();
+        if (backupFolders.size() < processors) {
+            threadPoolSize = backupFolders.size();
         }
 
         ExecutorService executorService = Executors.newFixedThreadPool(threadPoolSize);
 
-        List<Callable<Void>> toExecute = new ArrayList<>();
-
-        for (String propName : propToFolderName.keySet()) {
+        for (Path toArchive : backupFolders.keySet()) {
             toExecute.add(() -> {
-                String path = properties.getProperty(propName);
-                Path toArchive = Paths.get(path);
-                Path archivePath;
-                String zipName = propToFolderName.get(propName) + "-" + DATE_TIME_FORMATTER.format(LocalDateTime.now()) + ".zip";
-                if (Files.isDirectory(toArchive)) {
-                    archivePath = Paths.get(toArchive.toString(), zipName);
-                } else {
-                    Path parent = toArchive.getParent();
-                    archivePath = Paths.get(parent.toString(), zipName);
-                }
+                String zipName = backupFolders.get(toArchive) + "-" + DATE_TIME_FORMATTER.format(LocalDateTime.now()) + ".zip";
+                Path archivePath = Files.isDirectory(toArchive) ? Paths.get(toArchive.toString(), zipName) : Paths.get(toArchive.getParent().toString(), zipName);
                 archive(toArchive, archivePath);
                 Link uploadLink = client.getUploadLink(backupFolderPath + "/" + zipName, false);
                 client.uploadFile(uploadLink, false, archivePath.toFile(), null);
@@ -92,29 +88,6 @@ public class Main {
         executorService.invokeAll(toExecute);
         // TODO: 04.06.17 проверка на то что все прошло хорошо, если нет, расказать об этом
         executorService.shutdown();
-    }
-
-    private static Map<String, String> propertieToName(Properties properties) {
-        Map<String, String> propToFolderName = new HashMap<>();
-
-        Enumeration<String> enumeration = (Enumeration<String>) properties.propertyNames();
-        while (enumeration.hasMoreElements()) {
-            String propertyName = enumeration.nextElement();
-            if (!StringUtils.startsWith(propertyName, "backup")) {
-                continue;
-            }
-            String folderName = StringUtils.substringAfter(propertyName, ".");
-            if (StringUtils.isBlank(folderName) || StringUtils.contains(folderName, ".")) {
-                throw new IllegalArgumentException("Property name " + propertyName + " not valid.");
-            }
-            String propValue = properties.getProperty(propertyName);
-            if (StringUtils.isBlank(propValue) || Files.notExists(Paths.get(propValue))) {
-                throw new IllegalArgumentException("Not valid value of propertie: " + propertyName + "  - " + propValue + ". Value empty or path not exist");
-            }
-
-            propToFolderName.put(propertyName, folderName);
-        }
-        return propToFolderName;
     }
 
     public static void archive(Path folderToArchive, Path outputPath) {
@@ -147,22 +120,15 @@ public class Main {
         }
     }
 
-
-    private static Properties readProperties(String[] args) throws IOException {
+    private static Configuration readConfiguration(String pathToProperties) throws IOException {
         Properties properties = new Properties();
 
-        Path propertiesPath;
-        if (args != null && args.length > 0 && args[0] != null) {
-            propertiesPath = Paths.get(args[0]);
-        } else {
-            propertiesPath = Paths.get("properties");
+        Path propertiesPath = Paths.get(pathToProperties);
+        if (Files.notExists(propertiesPath)) {
+            throw new IllegalArgumentException("Not valid path to properties or properties does not exist");
         }
-        if (Files.exists(propertiesPath)) {
-            try (BufferedReader bufferedReader = Files.newBufferedReader(propertiesPath, StandardCharsets.UTF_8)) {
-                properties.load(bufferedReader);
-            }
-        } else {
-            throw new IllegalArgumentException("Properties not found: " + propertiesPath);
+        try (BufferedReader bufferedReader = Files.newBufferedReader(propertiesPath, StandardCharsets.UTF_8)) {
+            properties.load(bufferedReader);
         }
         if (!properties.containsKey("otoken")) {
             throw new IllegalArgumentException("otoken not defined");
@@ -173,6 +139,72 @@ public class Main {
         if (!properties.containsKey("yadisk.backup.folder")) {
             throw new IllegalArgumentException("yadisk.backup.folder not defined");
         }
-        return properties;
+
+        Map<Path, String> propToFolderName = getPathStringMap(properties);
+        return new Configuration(properties.getProperty("otoken"),
+                properties.getProperty("user"),
+                BooleanUtils.toBoolean(properties.getProperty("remove.after.backup", "true")),
+                properties.getProperty("yadisk.backup.folder"),
+                propToFolderName);
+    }
+
+    private static Map<Path, String> getPathStringMap(Properties properties) {
+        Map<Path, String> propToFolderName = new HashMap<>();
+
+        Enumeration<String> enumeration = (Enumeration<String>) properties.propertyNames();
+        while (enumeration.hasMoreElements()) {
+            String propertyName = enumeration.nextElement();
+            if (!StringUtils.startsWith(propertyName, "backup")) {
+                continue;
+            }
+            String folderName = StringUtils.substringAfter(propertyName, ".");
+            if (StringUtils.isBlank(folderName)) {
+                throw new IllegalArgumentException("Property name " + propertyName + " not valid.");
+            }
+            String propValue = properties.getProperty(propertyName);
+            if (StringUtils.isBlank(propValue) || Files.notExists(Paths.get(propValue))) {
+                throw new IllegalArgumentException("Not valid value of propertie: " + propertyName + "  - " + propValue + ". Value empty or path not exist");
+            }
+
+            propToFolderName.put(Paths.get(propValue), folderName);
+        }
+        return propToFolderName;
+    }
+
+    private static class Configuration {
+        private final String token;
+        private final String user;
+        private final boolean removeArchiveAfterBackup;
+        private final String yandexDiskFolder;
+        //key - Path путь до файла, value - название выходного архива
+        private final Map<Path, String> backupFolders;
+
+        public Configuration(String token, String user, boolean removeArchiveAfterBackup, String yandexDiskFolder, Map<Path, String> backupFolders) {
+            this.token = token;
+            this.user = user;
+            this.removeArchiveAfterBackup = removeArchiveAfterBackup;
+            this.yandexDiskFolder = yandexDiskFolder;
+            this.backupFolders = Collections.unmodifiableMap(new HashMap<>(backupFolders));
+        }
+
+        public String getToken() {
+            return token;
+        }
+
+        public String getUser() {
+            return user;
+        }
+
+        public boolean isRemoveArchiveAfterBackup() {
+            return removeArchiveAfterBackup;
+        }
+
+        public String getYandexDiskFolder() {
+            return yandexDiskFolder;
+        }
+
+        public Map<Path, String> getBackupFolders() {
+            return backupFolders;
+        }
     }
 }
